@@ -47,8 +47,10 @@ env:
   BITRATE: "2500k"                # 720p ke liye perfect; 1080p source ho to 4500k
   MAXRATE: "3000k"
   RELAY_PORT: "8080"
-  RELAY_STALE: "7"                 # source itni der naya segment na de -> placeholder
-  RELAY_DWELL: "5"                 # placeholder kam se kam itni der (flicker nahi)
+  RELAY_STALE: "12"                # source itni der naya segment na de -> placeholder
+  RELAY_DWELL: "8"                 # placeholder kam se kam itni der (flicker/flap nahi)
+  RELAY_KEEP: "15"                 # playlist window (30s) — ffmpeg kabhi peeche nahi rehta
+  RELAY_TRASH_TTL: "120"           # segments 2 min disk par (404 kabhi nahi)
   UA: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 jobs:
@@ -81,6 +83,22 @@ jobs:
             sleep 3
           done
           echo "::warning::6 minute tak slot na mila — phir bhi shuru kar rahe hain"
+
+      - name: Version check (run summary me dikhega)
+        run: |
+          {
+            echo "### YT Live 24x7 — ENGINE v3.0"
+            echo ""
+            echo "| cheez | value |"
+            echo "|---|---|"
+            echo "| relay version | **3.0** (no-404 · no-shrink · fresh retry) |"
+            echo "| source | \`$SOURCE_URL\` |"
+            echo "| window | ${WINDOW}s (5h30m) |"
+            echo "| bitrate | ${BITRATE} / max ${MAXRATE} |"
+            echo "| watchdog cron | every 20 min |"
+            echo ""
+            echo "stream band nahi hoti: source down -> placeholder screen rotate hoti hai"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/checkout@v4
         with:
@@ -126,18 +144,18 @@ jobs:
           cat > /tmp/relay.py <<'PYEOF'
           #!/usr/bin/env python3
           """
-          relay.py — seamless HLS failover relay for the YT 24/7 GitHub Action.
+          relay.py v2 — bulletproof HLS failover relay (YouTube 24/7 ke liye).
 
-          Ek hi ffmpeg is local playlist se padhta hai (copy mode, HD):
-              http://127.0.0.1:PORT/index.m3u8
+          Guarantees (yahi "stream kabhi na ruke" ka asal mechanism hai):
+            1. playlist kabhi khaali / chhoti / peeche nahi hoti  -> ffmpeg ko kabhi
+               "segment missing" ya "playlist behind" nahi milta
+            2. koi segment request 404 nahi hoti — missing ho to last-good bytes 200
+               milte hain (ffmpeg atakta nahi, YouTube ko data behta rehta hai)
+            3. source dead -> placeholder pool se turant segments (CPU ~0)
+            4. transition par purani entries flush NAHI hoti (window shrink = ffmpeg stall)
+            5. files 120s tak disk par rehti hain (in-flight reads safe)
 
-          Relay upstream (aapki m3u8) ko poll karta hai:
-            * upstream healthy  -> uske naye segments local playlist me append (LIVE)
-            * upstream dead     -> placeholder segments generate karke append (RECONNECTING screen)
-              (discontinuity flag ke sath, is liye ffmpeg kabhi exit nahi hota,
-               timestamps bhi monotonic rehte hain -> YouTube par stream break nahi hoti)
-
-          Endpoints: /index.m3u8, /<seg>.ts, /status.json, /healthz
+          Endpoints: /index.m3u8, /<seg>, /status.json, /healthz
           """
           import json
           import os
@@ -153,27 +171,32 @@ jobs:
           PORT = int(os.environ.get("RELAY_PORT", "8080"))
           WORK = os.environ.get("RELAY_DIR", "/tmp/relay")
           SEG_DUR = float(os.environ.get("RELAY_SEG_DUR", "2"))
-          KEEP = int(os.environ.get("RELAY_KEEP", "7"))
+          KEEP = int(os.environ.get("RELAY_KEEP", "15"))          # 30s window ffmpeg ke liye
+          TRASH_TTL = float(os.environ.get("RELAY_TRASH_TTL", "120"))
           POLL = float(os.environ.get("RELAY_POLL", "1"))
-          UA = os.environ.get(
-              "UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-          )
+          STALE = float(os.environ.get("RELAY_STALE", "8"))
+          DWELL = float(os.environ.get("RELAY_DWELL", "5"))
+          UA = os.environ.get("UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
           FALLBACK_TEXT = os.environ.get("FALLBACK_TEXT", "Stream will resume shortly")
           FALLBACK_SUB = os.environ.get("FALLBACK_SUBTEXT", "Auto-reconnect is active. Please stay tuned.")
           FALLBACK_BADGE = os.environ.get("FALLBACK_BADGE", "RECONNECTING")
           FALLBACK_FOOTER = os.environ.get("FALLBACK_FOOTER", "24/7 LIVE BROADCAST")
-          DYN = os.environ.get("DYN_FALLBACK", "1") == "1"     # on-the-fly status screen
           W = int(os.environ.get("W", "1280"))
           H = int(os.environ.get("H", "720"))
           FPS = int(os.environ.get("FPS", "25"))
           FONT = os.environ.get("FONT", "")
+          POOL_N = 3
 
           LOG = deque(maxlen=200)
           LOCK = threading.Lock()
-          ENTRIES = deque()          # {"name":.., "dur":.., "disc":bool, "seq":int}
-          TRASH = []                 # [(path, ts)]  — 20s baad delete (ffmpeg ko 404 na mile)
-          STATE = {"mode": "init", "reason": "starting", "live_seq": -1, "switched": 0,
-                   "up_ok": 0, "up_fail": 0, "seg_index": 0, "started": time.time()}
+          ENTRIES = deque()              # {"name","dur","disc","seq"}
+          TRASH = []                     # [(path, ts)]
+          POOL = []                      # cached placeholder segment names
+          LAST_GOOD = {"name": None}
+          VER = "3.0"
+          STATE = {"ver": VER, "mode": "init", "reason": "starting", "switched": 0, "up_ok": 0,
+                   "up_fail": 0, "seg_index": 0, "started": time.time(), "served_404": 0}
 
 
           def log(msg):
@@ -186,13 +209,20 @@ jobs:
 
 
           def fetch(url, timeout=8):
-              req = urllib.request.Request(url, headers={"User-Agent": UA, "Cache-Control": "no-cache"})
+              """har dafa FRESH request (cache-busting + no-cache) — stale proxy/CDN se bachne ke liye."""
+              sep = "&" if "?" in url else "?"
+              fresh = f"{url}{sep}_yt={int(time.time() * 1000)}"
+              req = urllib.request.Request(fresh, headers={
+                  "User-Agent": UA,
+                  "Cache-Control": "no-cache, no-store, max-age=0",
+                  "Pragma": "no-cache",
+                  "Accept": "*/*",
+              })
               with urllib.request.urlopen(req, timeout=timeout) as r:
                   return r.status, r.read()
 
 
           def parse_playlist(body):
-              """returns (media_seq, [(uri, dur)])"""
               if isinstance(body, bytes):
                   body = body.decode("utf-8", "ignore")
               seq = 0
@@ -214,80 +244,63 @@ jobs:
 
 
           def abs_url(base, uri):
-              if uri.startswith("http"):
-                  return uri
-              return base.rsplit("/", 1)[0] + "/" + uri
+              return uri if uri.startswith("http") else base.rsplit("/", 1)[0] + "/" + uri
 
 
-          # ---------------------------------------------------------------------------
-          # placeholder segment builder (dyn: har segment fresh, clock + reason ke sath)
-          # ---------------------------------------------------------------------------
-          def make_fallback_seg(idx, reason):
-              """2s ka placeholder .ts — source format ke exact size/fps me."""
-              name = f"fb_{idx:06d}.ts"
-              path = os.path.join(WORK, name)
-              text1 = os.path.join(WORK, "t_main.txt")
-              text2 = os.path.join(WORK, "t_sub.txt")
-              text3 = os.path.join(WORK, "t_badge.txt")
-              text4 = os.path.join(WORK, "t_foot.txt")
-              text5 = os.path.join(WORK, "t_reason.txt")
-              open(text1, "w").write(FALLBACK_TEXT)
-              open(text2, "w").write(FALLBACK_SUB)
-              open(text3, "w").write(FALLBACK_BADGE)
-              open(text4, "w").write(FALLBACK_FOOTER)
-              open(text5, "w").write((reason or "auto-retry active")[:70])
-
-              vf = "drawbox=x=0:y=0:w=iw:h=ih:color=0x0a1020@1:t=fill"
-              vf += f",drawbox=x=0:y=0:w=iw:h={max(4, H // 80)}:color=0xef4444@1:t=fill"
+          # ---------------------------------------------------------------- placeholder
+          def build_pool():
+              """Boot par 3 placeholder segments (rotate) — outage me CPU ~0 lagta hai."""
+              global POOL
               if FONT and os.path.exists(FONT):
+                  files = {}
+                  for k, v in (("t_badge", FALLBACK_BADGE), ("t_main", FALLBACK_TEXT),
+                               ("t_sub", FALLBACK_SUB), ("t_foot", FALLBACK_FOOTER)):
+                      p = os.path.join(WORK, k + ".txt")
+                      open(p, "w").write(v)
+                      files[k] = p
+                  base = ("drawbox=x=0:y=0:w=iw:h=ih:color=0x0a1020@1:t=fill"
+                          f",drawbox=x=0:y=0:w=iw:h={max(4, H // 80)}:color=0xef4444@1:t=fill")
                   f = f"fontfile={FONT}:"
-                  vf += (f",drawtext={f}textfile={text3}:fontcolor=0xef4444:fontsize={max(16, H//22)}"
-                         f":x=(w-tw)/2:y=(h/2)-{int(H*0.28)}:alpha='0.35+0.65*abs(sin(t*2.2))'")
-                  vf += (f",drawtext={f}textfile={text1}:fontcolor=white:fontsize={max(22, H//13)}"
-                         f":x=(w-tw)/2:y=(h/2)-{int(H*0.07)}")
-                  vf += (f",drawtext={f}textfile={text2}:fontcolor=0x94a3b8:fontsize={max(13, H//27)}"
-                         f":x=(w-tw)/2:y=(h/2)+{int(H*0.07)}")
-                  vf += (f",drawtext={f}textfile={text5}:fontcolor=0x64748b:fontsize={max(11, H//38)}"
-                         f":x=(w-tw)/2:y=(h/2)+{int(H*0.16)}")
-                  vf += (f",drawtext={f}textfile={text4}:fontcolor=0x475569:fontsize={max(10, H//44)}"
-                         f":x=(w-tw)/2:y=h-{int(H*0.08)}:alpha='0.55+0.45*abs(sin(t*1.1))'")
-              vf += ",format=yuv420p"
+                  base += (f",drawtext={f}textfile={files['t_badge']}:fontcolor=0xef4444:fontsize={max(16, H//22)}"
+                           f":x=(w-tw)/2:y=(h/2)-{int(H*0.28)}:alpha='0.35+0.65*abs(sin(t*2.2))'")
+                  base += (f",drawtext={f}textfile={files['t_main']}:fontcolor=white:fontsize={max(22, H//13)}"
+                           f":x=(w-tw)/2:y=(h/2)-{int(H*0.07)}")
+                  base += (f",drawtext={f}textfile={files['t_sub']}:fontcolor=0x94a3b8:fontsize={max(13, H//27)}"
+                           f":x=(w-tw)/2:y=(h/2)+{int(H*0.07)}")
+                  base += (f",drawtext={f}textfile={files['t_foot']}:fontcolor=0x475569:fontsize={max(10, H//44)}"
+                           f":x=(w-tw)/2:y=h-{int(H*0.08)}:alpha='0.55+0.45*abs(sin(t*1.1))'")
+                  vf = base + ",format=yuv420p"
+              else:
+                  vf = "drawbox=x=0:y=0:w=iw:h=ih:color=0x0a1020@1:t=fill,format=yuv420p"
 
-              cmd = [
-                  "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                  "-f", "lavfi", "-i", f"color=c=0x0a1020:s={W}x{H}:r={FPS}",
-                  "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                  "-t", str(SEG_DUR), "-vf", vf,
-                  "-c:v", "libx264", "-profile:v", "main", "-preset", "veryfast",
-                  "-b:v", "900k", "-maxrate", "1400k", "-bufsize", "2800k",
-                  "-g", str(int(FPS * SEG_DUR)), "-keyint_min", str(int(FPS * SEG_DUR)),
-                  "-sc_threshold", "0", "-pix_fmt", "yuv420p",
-                  "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-                  "-f", "mpegts", path,
-              ]
-              r = subprocess.run(cmd, capture_output=True, text=True)
-              if r.returncode != 0 or not os.path.exists(path):
-                  log(f"fallback seg fail: {(r.stderr or '')[-300:]}")
-                  return None
-              return name
-
-
-          def _trash(name):
-              TRASH.append((os.path.join(WORK, name), time.time()))
+              for i in range(POOL_N):
+                  name = f"pool_{i}.ts"
+                  path = os.path.join(WORK, name)
+                  cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                         "-f", "lavfi", "-i", f"color=c=0x0a1020:s={W}x{H}:r={FPS}",
+                         "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                         "-t", str(SEG_DUR), "-vf", vf,
+                         "-c:v", "libx264", "-profile:v", "main", "-preset", "ultrafast",
+                         "-b:v", "700k", "-maxrate", "1000k", "-bufsize", "2000k",
+                         "-g", str(int(FPS * SEG_DUR)), "-keyint_min", str(int(FPS * SEG_DUR)),
+                         "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+                         "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                         "-f", "mpegts", "-copyts", path]
+                  r = subprocess.run(cmd, capture_output=True, text=True)
+                  if r.returncode != 0 or not os.path.exists(path):
+                      log(f"pool seg {i} fail: {(r.stderr or '')[-200:]}")
+                  else:
+                      POOL.append(name)
+              log(f"placeholder pool ready: {len(POOL)} segments")
 
 
-          def prune():
+          def add_entry(name, dur, disc):
               with LOCK:
+                  STATE["seg_index"] += 1
+                  ENTRIES.append({"name": name, "dur": dur, "disc": disc, "seq": STATE["seg_index"]})
+                  LAST_GOOD["name"] = name
                   while len(ENTRIES) > KEEP:
-                      _trash(ENTRIES.popleft()["name"])
-
-
-          def flush_keep(n=2):
-              """Transition par purani entries hata do — playlist ek hi content type ka
-              rehta hai (fallback↔live mix se video stall na ho)."""
-              with LOCK:
-                  while len(ENTRIES) > n:
-                      _trash(ENTRIES.popleft()["name"])
+                      TRASH.append((os.path.join(WORK, ENTRIES.popleft()["name"]), time.time()))
 
 
           def janitor():
@@ -296,7 +309,7 @@ jobs:
                   with LOCK:
                       keep = []
                       for path, ts in TRASH:
-                          if now - ts > 20:
+                          if now - ts > TRASH_TTL:
                               try:
                                   os.remove(path)
                               except OSError:
@@ -304,35 +317,59 @@ jobs:
                           else:
                               keep.append((path, ts))
                       TRASH[:] = keep
-                  time.sleep(2)
+                  time.sleep(3)
 
 
-          def append(name, dur, disc):
-              with LOCK:
-                  STATE["seg_index"] += 1
-                  ENTRIES.append({"name": name, "dur": dur, "disc": disc, "seq": STATE["seg_index"]})
-              prune()
+          # ---------------------------------------------------------------- upstream
+          def prime():
+              """Boot: live segments (clean start) warna placeholder pool."""
+              end = time.time() + 6
+              seq0 = None
+              while time.time() < end and UPSTREAM:
+                  try:
+                      st, body = fetch(UPSTREAM)
+                      if st == 200 and b"#EXTM3U" in body:
+                          useq, items = parse_playlist(body)
+                          if items:
+                              for uri, dur in items[-3:]:
+                                  u = abs_url(UPSTREAM, uri)
+                                  name = "lv_" + re.sub(r"[^A-Za-z0-9._-]", "_", uri.split("/")[-1])
+                                  path = os.path.join(WORK, name)
+                                  try:
+                                      st2, data = fetch(u, timeout=12)
+                                      if st2 == 200 and len(data) > 1000:
+                                          with open(path + ".tmp", "wb") as f:
+                                              f.write(data)
+                                          os.replace(path + ".tmp", path)
+                                          add_entry(name, dur, True)
+                                  except Exception:
+                                      pass
+                              if ENTRIES:
+                                  seq0 = useq
+                                  log(f"primed {len(ENTRIES)} LIVE segments (clean start)")
+                                  return seq0
+                  except Exception:
+                      pass
+                  time.sleep(1)
+              for _ in range(POOL_N if POOL else 0):
+                  add_entry(POOL[_ % len(POOL)], SEG_DUR, True)
+              log(f"primed {len(ENTRIES)} placeholder segments (source down at boot)")
+              return None
 
 
-          # ---------------------------------------------------------------------------
-          def monitor():
-              """Upstream poll -> naye segments download; down/stale -> placeholder segments.
-              'Reachable magar abhi naya segment nahi' == healthy (fallback nahi)."""
-              last_seq = PRE.get("seq")
-              in_fallback = False if last_seq is not None else True
-              next_fb = 0.0
+          def monitor(seq0):
+              last_seq = seq0
+              in_fallback = seq0 is None
               last_new = time.time()
-              STALE = float(os.environ.get("RELAY_STALE", "7"))
-              DWELL = float(os.environ.get("RELAY_DWELL", "5"))   # placeholder kam se kam itni der
               hold_until = 0.0
-
+              pool_i = 0
               while True:
-                  reachable = False
                   got = 0
+                  reachable = False
                   try:
                       if UPSTREAM:
-                          status, body = fetch(UPSTREAM)
-                          if status == 200 and b"#EXTM3U" in body:
+                          st, body = fetch(UPSTREAM)
+                          if st == 200 and b"#EXTM3U" in body:
                               reachable = True
                               useq, items = parse_playlist(body)
                               if items:
@@ -343,76 +380,77 @@ jobs:
                                   else:
                                       take = []
                                   if in_fallback and time.time() < hold_until:
-                                      take = []          # abhi placeholder dikhne do (flicker nahi)
+                                      take = []
                                   for uri, dur in take[-4:]:
                                       u = abs_url(UPSTREAM, uri)
                                       name = "lv_" + re.sub(r"[^A-Za-z0-9._-]", "_", uri.split("/")[-1])
                                       path = os.path.join(WORK, name)
+                                      if os.path.exists(path) and os.path.getsize(path) > 1000:
+                                          add_entry(name, dur, in_fallback)
+                                          got += 1
+                                          continue
                                       try:
-                                          st, data = fetch(u, timeout=12)
-                                          if st != 200 or len(data) < 1000:
-                                              raise ValueError(f"seg http {st}")
+                                          st2, data = fetch(u, timeout=12)
+                                          if st2 != 200 or len(data) < 1000:
+                                              raise ValueError(f"http {st2}")
                                           with open(path + ".tmp", "wb") as f:
                                               f.write(data)
                                           os.replace(path + ".tmp", path)
-                                          append(name, dur, in_fallback)
+                                          add_entry(name, dur, in_fallback)
                                           got += 1
                                       except Exception as e:
                                           reachable = False
-                                          STATE["reason"] = f"segment fetch: {type(e).__name__}"
+                                          STATE["reason"] = f"seg fetch: {type(e).__name__}"
                                           break
                                   if got:
                                       last_seq = useq
-                              if got == 0 and last_seq is None:
-                                  STATE["reason"] = "playlist me segments nahi"
                   except Exception as e:
-                      STATE["up_fail"] = STATE["up_fail"] + 1
-                      STATE["reason"] = f"{type(e).__name__}: {str(e)[:80]}"
+                      STATE["up_fail"] += 1
+                      STATE["reason"] = f"{type(e).__name__}: {str(e)[:70]}"
 
                   now = time.time()
                   if got:
                       last_new = now
-                      if in_fallback:            # fallback -> live transition: clean cut
-                          flush_keep(3)
-                          log(f"transition fallback->live (flushed, kept 2)")
-                          in_fallback = False
-                          next_fb = 0.0
-                  healthy = reachable and (now - last_new) < STALE
-
-                  if healthy:
                       if in_fallback:
                           log("UPSTREAM BACK -> live segments")
                           in_fallback = False
-                          next_fb = 0.0
-                      STATE.update(mode="live", reason="live source", up_ok=STATE["up_ok"] + 1)
+                          hold_until = 0.0
+                          STATE["switched"] += 1
+                  healthy = reachable and (now - last_new) < STALE
+
+                  if healthy:
+                      STATE["mode"] = "live"
+                      STATE["up_ok"] += 1
+                      STATE["reason"] = "live source"
                   else:
                       if not in_fallback:
                           in_fallback = True
                           hold_until = now + DWELL
-                          flush_keep(3)          # live -> fallback transition: clean cut
-                          STATE["switched"] = STATE["switched"] + 1
-                          log(f"UPSTREAM DOWN ({STATE['reason']}) -> placeholder screen")
-                          next_fb = 0.0
+                          STATE["switched"] += 1
+                          log(f"UPSTREAM DOWN ({STATE['reason']}) -> placeholder (no flush, window intact)")
                       STATE["mode"] = "fallback"
-                      STATE["up_fail"] = STATE["up_fail"] + 1
-                      if now >= next_fb:
-                          name = make_fallback_seg(STATE["seg_index"] + 1, STATE["reason"]) if DYN else None
-                          if name:
-                              append(name, SEG_DUR, True)
-                          next_fb = now + SEG_DUR      # note: last_new ko chhoote nahi
-                                                       # (warna live check galat healthy ho jata hai)
+                      STATE["up_fail"] += 1
+                      # pool se turant segment (CPU ~0), har SEG_DUR par
+                      if time.time() >= hold_until and (time.time() - last_new) >= SEG_DUR * 0.85:
+                          if POOL:
+                              add_entry(POOL[pool_i % len(POOL)], SEG_DUR, in_fallback)
+                              pool_i += 1
+                              last_new = time.time()
 
                   time.sleep(POLL)
 
 
-          # ---------------------------------------------------------------------------
+          # ---------------------------------------------------------------- serving
           def playlist_text():
               with LOCK:
                   entries = list(ENTRIES)
               if not entries:
-                  return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n"
-              lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{int(max(SEG_DUR, 4))}",
-                       f"#EXT-X-MEDIA-SEQUENCE:{entries[0]['seq']}", "#EXT-X-INDEPENDENT-SEGMENTS"]
+                  return ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n"
+                          "#EXT-X-MEDIA-SEQUENCE:0\n")
+              lines = ["#EXTM3U", "#EXT-X-VERSION:3",
+                       f"#EXT-X-TARGETDURATION:{int(max(SEG_DUR, 4))}",
+                       f"#EXT-X-MEDIA-SEQUENCE:{entries[0]['seq']}",
+                       "#EXT-X-INDEPENDENT-SEGMENTS"]
               for e in entries:
                   if e["disc"]:
                       lines.append("#EXT-X-DISCONTINUITY")
@@ -424,14 +462,6 @@ jobs:
           class Handler(BaseHTTPRequestHandler):
               protocol_version = "HTTP/1.1"
 
-              def _send(self, code, body, ctype):
-                  if isinstance(body, str):
-                      body = body.encode()
-                  try:
-                      self._raw(code, body, ctype)
-                  except (BrokenPipeError, ConnectionResetError):
-                      pass
-
               def _raw(self, code, body, ctype):
                   self.send_response(code)
                   self.send_header("Content-Type", ctype)
@@ -441,32 +471,13 @@ jobs:
                   self.end_headers()
                   self.wfile.write(body)
 
-              def do_GET(self):
-                  p = self.path.split("?")[0]
-                  if p in ("/index.m3u8", "/live.m3u8"):
-                      self._send(200, playlist_text(), "application/vnd.apple.mpegurl")
-                  elif p == "/status.json":
-                      with LOCK:
-                          st = dict(STATE)
-                          st["segments"] = len(ENTRIES)
-                          st["log"] = list(LOG)[-40:]
-                      self._send(200, json.dumps(st), "application/json")
-                  elif p == "/healthz":
-                      self._send(200, '{"ok":true}', "application/json")
-                  else:
-                      name = p.lstrip("/")
-                      fp = os.path.join(WORK, os.path.basename(name))
-                      try:
-                          if os.path.exists(fp):
-                              with open(fp, "rb") as f:
-                                  self._raw(200, f.read(), "video/mp2t")
-                          else:
-                              self._raw(404, b"nope", "text/plain")
-                      except (BrokenPipeError, ConnectionResetError, FileNotFoundError):
-                          pass
-
-              def log_message(self, *a):
-                  pass
+              def _send(self, code, body, ctype):
+                  if isinstance(body, str):
+                      body = body.encode()
+                  try:
+                      self._raw(code, body, ctype)
+                  except (BrokenPipeError, ConnectionResetError):
+                      self.close_connection = True
 
               def handle_one_request(self):
                   try:
@@ -474,48 +485,61 @@ jobs:
                   except (BrokenPipeError, ConnectionResetError):
                       self.close_connection = True
 
+              def do_GET(self):
+                  p = self.path.split("?")[0]
+                  if p in ("/index.m3u8", "/live.m3u8"):
+                      self._send(200, playlist_text(), "application/vnd.apple.mpegurl")
+                      return
+                  if p == "/status.json":
+                      with LOCK:
+                          st = dict(STATE)
+                          st["segments"] = len(ENTRIES)
+                          st["pool"] = len(POOL)
+                          st["log"] = list(LOG)[-30:]
+                      self._send(200, json.dumps(st), "application/json")
+                      return
+                  if p == "/healthz":
+                      self._send(200, '{"ok":true}', "application/json")
+                      return
 
-          PRE = {"seq": None}
-
-
-          def prime():
-              """Boot: pehle LIVE segments try karo (mix na bane), warna fallback prime."""
-              end = time.time() + 6
-              while time.time() < end and UPSTREAM:
+                  name = os.path.basename(p.lstrip("/"))
+                  fp = os.path.join(WORK, name)
                   try:
-                      st, body = fetch(UPSTREAM)
-                      if st == 200 and b"#EXTM3U" in body:
-                          useq, items = parse_playlist(body)
-                          if items:
-                              for uri, dur in items[-3:]:
-                                  u = abs_url(UPSTREAM, uri)
-                                  name = "lv_" + re.sub(r"[^A-Za-z0-9._-]", "_", uri.split("/")[-1])
-                                  path = os.path.join(WORK, name)
-                                  st2, data = fetch(u, timeout=12)
-                                  if st2 == 200 and len(data) > 1000:
-                                      with open(path + ".tmp", "wb") as f:
-                                          f.write(data)
-                                      os.replace(path + ".tmp", path)
-                                      append(name, dur, True)
-                              if ENTRIES:
-                                  PRE["seq"] = useq
-                                  log(f"primed {len(ENTRIES)} LIVE segments (clean start)")
+                      if os.path.exists(fp):
+                          with open(fp, "rb") as f:
+                              self._raw(200, f.read(), "video/mp2t")
+                          return
+                      # NEVER 404: last-good ya newest available segment de do
+                      State = None
+                      with LOCK:
+                          State = LAST_GOOD["name"]
+                      for cand in (State, POOL[0] if POOL else None):
+                          if cand:
+                              cp = os.path.join(WORK, cand)
+                              if os.path.exists(cp):
+                                  with open(cp, "rb") as f:
+                                      self._raw(200, f.read(), "video/mp2t")
+                                  STATE["served_404"] += 1
                                   return
-                  except Exception:
-                      pass
-                  time.sleep(1)
-              for i in range(3):
-                  n = make_fallback_seg(STATE["seg_index"] + 1, "starting upstream")
-                  if n:
-                      append(n, SEG_DUR, True)
-              log(f"primed {len(ENTRIES)} fallback segments (source down at boot bhi chalega)")
+                      self._raw(200, b"", "video/mp2t")
+                  except (BrokenPipeError, ConnectionResetError, FileNotFoundError):
+                      self.close_connection = True
+
+              def log_message(self, *a):
+                  pass
 
 
           def main():
-              prime()
+              build_pool()
               threading.Thread(target=janitor, daemon=True).start()
-              threading.Thread(target=monitor, daemon=True).start()
-              log(f"relay on :{PORT} | upstream={UPSTREAM} | {W}x{H}@{FPS} dyn={DYN}")
+              seq0 = prime()
+              threading.Thread(target=monitor, args=(seq0,), daemon=True).start()
+              log("═" * 62)
+              log(f"YTLIVE RELAY v{VER}  (no-404 · no-shrink · fresh-request retry)")
+              log(f"listen :{PORT} | upstream={UPSTREAM}")
+              log(f"format {W}x{H}@{FPS} | window={KEEP} segs ({int(KEEP*SEG_DUR)}s) | stale={STALE}s")
+              log("source down => placeholder pool rotate, encoder kabhi nahi rukta (0s gap)")
+              log("═" * 62)
               ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 
 
@@ -523,7 +547,12 @@ jobs:
               main()
           PYEOF
           python3 - <<'CHK'
-          import ast; ast.parse(open("/tmp/relay.py").read()); print("relay.py syntax OK")
+          import ast
+          src = open("/tmp/relay.py").read()
+          ast.parse(src)
+          ver = "3.0" if 'VER = "3.0"' in src else "OLD"
+          print(f"relay.py syntax OK | RELAY VERSION = {ver}")
+          assert ver == "3.0", "embedded relay purana hai — YML dobara copy karein"
           CHK
 
       # ───────────────────────────────────────────────────────────────────────
@@ -539,6 +568,10 @@ jobs:
             echo "::error::Repo secret YT_STREAM_KEY missing (Settings → Secrets and variables → Actions)"
             exit 1
           fi
+          echo "══════════════════════════════════════════════════════════════"
+          echo " YTLIVE ENGINE v3.0  (relay v3: no-404 · no-shrink · fresh req)"
+          echo " version verify: status.json me \"ver\":\"3.0\" aur \"pool\" dikhega"
+          echo "══════════════════════════════════════════════════════════════"
           DEST="$RTMP_BASE/$YT_STREAM_KEY"
           RELAY_DIR=/tmp/relay; mkdir -p "$RELAY_DIR"
           FONT=$(fc-match -f '%{file}' "DejaVu Sans:bold" 2>/dev/null || true)
@@ -550,9 +583,12 @@ jobs:
             W="$SRC_W" H="$SRC_H" FPS="$SRC_FPS" FONT="$FONT" \
             python3 /tmp/relay.py >> /tmp/relay_out.log 2>&1 &
             RELAY_PID=$!
-            for i in $(seq 1 40); do
-              curl -fsS -m 2 "http://127.0.0.1:$RELAY_PORT/healthz" >/dev/null 2>&1 && \
-                { echo "relay up (pid $RELAY_PID)"; return 0; }
+            for i in $(seq 1 60); do
+              SEGS=$(curl -sS -m 2 "http://127.0.0.1:$RELAY_PORT/status.json" 2>/dev/null \
+                     | jq -r '.segments // 0' 2>/dev/null || echo 0)
+              if [ "${SEGS:-0}" -ge 3 ]; then
+                echo "relay ready (pid $RELAY_PID, ${SEGS} segments)"; return 0
+              fi
               sleep 1
             done
             echo "::warning::relay health check fail"; return 0
@@ -563,7 +599,7 @@ jobs:
           ( while : ; do
               sleep 45
               S=$(curl -sS -m 4 "http://127.0.0.1:$RELAY_PORT/status.json" 2>/dev/null || echo '{}')
-              echo "[status] $(echo "$S" | jq -c '{mode,segments,switched,up_fail,reason}' 2>/dev/null || echo "$S")"
+              echo "[status v3] $(echo "$S" | jq -c '{ver,mode,segments,pool,switched,up_fail,served_404,reason}' 2>/dev/null || echo "$S")"
               kill -0 $RELAY_PID 2>/dev/null || { echo "[relay] mar gaya — restart"; start_relay; }
             done ) &
           WATCH=$!
@@ -583,39 +619,59 @@ jobs:
             done ) &
           HANDOFF_PID=$!
 
+          # ---------- video filter (scale sirf zarurat par = CPU bachta hai) ----------
+          VF="fps=$SRC_FPS,setpts=N/($SRC_FPS*TB),format=yuv420p"
+          SRC_DIM=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+                    -of csv=p=0:nk=1 "$SOURCE_URL" 2>/dev/null | head -1 | tr -d ' ' || true)
+          if [ "${SRC_DIM:-}" != "${SRC_W},${SRC_H}" ]; then
+            VF="scale=$SRC_W:$SRC_H:force_original_aspect_ratio=decrease,pad=$SRC_W:$SRC_H:(ow-iw)/2:(oh-ih)/2,$VF"
+            echo "source ${SRC_DIM:-?} -> output ${SRC_W}x${SRC_H} (scale ON)"
+          else
+            echo "source ${SRC_DIM} == output (scale OFF, CPU free)"
+          fi
+          PRESET="${PRESET:-superfast}"
+          echo "preset=$PRESET | vf=$VF"
+
           # ---------- main encoder loop ----------
           START=$(date +%s)
           RUNS=0
           while : ; do
             NOW=$(date +%s); ELAPSED=$(( NOW - START ))
             REMAIN=$(( WINDOW - ELAPSED ))
-            [ "$REMAIN" -le 90 ] && break          # window khatam → handoff
+            [ "$REMAIN" -le 120 ] && break         # window khatam → handoff
             RUNS=$(( RUNS + 1 ))
-            echo "──── encoder #$RUNS · elapsed ${ELAPSED}s · window ${REMAIN}s ────"
+            echo "──── encoder #$RUNS · elapsed ${ELAPSED}s · window ${REMAIN}s · $(date -u +%H:%M:%SZ) ────"
+            ENC_START=$(date +%s)
 
-            timeout --signal=INT $(( REMAIN + 15 )) ffmpeg -hide_banner -loglevel warning -nostdin \
-              -fflags +genpts+igndts -probesize 2000000 -analyzeduration 3000000 \
-              -live_start_index -1 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 \
-              -rw_timeout 20000000 \
+            : > /tmp/ff.err
+            timeout --signal=INT $(( REMAIN + 90 )) ffmpeg -hide_banner -loglevel warning -nostdin \
+              -err_detect ignore_err -fflags +genpts+igndts \
+              -probesize 2000000 -analyzeduration 3000000 -live_start_index -1 \
+              -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 \
+              -rw_timeout 20000000 -http_persistent 0 -max_reload 30 \
               -i "http://127.0.0.1:$RELAY_PORT/index.m3u8" \
               -t "$REMAIN" \
               -map 0:v:0 -map 0:a:0? \
-              -vf "scale=$SRC_W:$SRC_H:force_original_aspect_ratio=decrease,pad=$SRC_W:$SRC_H:(ow-iw)/2:(oh-ih)/2,fps=$SRC_FPS,setpts=N/($SRC_FPS*TB),format=yuv420p" \
+              -vf "$VF" \
               -af "aresample=async=1:first_pts=0,asetpts=N/SR/TB" \
               -fps_mode cfr \
-              -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -level 4.1 \
-              -b:v "$BITRATE" -maxrate "$MAXRATE" -bufsize 5000k \
+              -c:v libx264 -preset "$PRESET" -tune zerolatency -profile:v main -level 4.1 \
+              -x264-params "keyint=$(( SRC_FPS * 2 )):min-keyint=$(( SRC_FPS * 2 )):scenecut=0:rc-lookahead=0:bframes=0:ref=1:sync-lookahead=0" \
+              -b:v "$BITRATE" -maxrate "$MAXRATE" -bufsize 4000k \
               -g $(( SRC_FPS * 2 )) -keyint_min $(( SRC_FPS * 2 )) -sc_threshold 0 -pix_fmt yuv420p \
               -c:a aac -b:a 128k -ar 44100 -ac 2 \
               -max_muxing_queue_size 4096 -flvflags no_duration_filesize \
-              -f flv "$DEST" 2>&1 | grep -viE "deprecated pixel format|Queue input is backward|non monotonically increasing|Last message repeated" || true
+              -f flv "$DEST" > /tmp/ff.out 2>/tmp/ff.err
 
-            RC=${PIPESTATUS[0]:-$?}
+            RC=$?
+            ENC_WALL=$(( $(date +%s) - ENC_START ))
+            echo "encoder cycle: ${ENC_WALL}s wall / ${REMAIN}s window"
             if [ "$RC" -eq 0 ]; then
-              echo "encoder clean exit"; sleep 1
+              echo "encoder clean exit (window end)"; sleep 1
             else
-              echo "encoder rc=$RC — 2s me restart (relay zinda hai, stream continuity barqarar)"
-              sleep 2
+              echo "encoder rc=$RC — turant restart (0.5s). wajah:"
+              grep -iE "error|fail|refused|invalid|corrupt|denied|reject" /tmp/ff.err | tail -4 || tail -2 /tmp/ff.err
+              sleep 0.5
             fi
           done
 
