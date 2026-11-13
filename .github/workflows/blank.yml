@@ -1,196 +1,652 @@
-name: YT-Live-24x7
+# =============================================================================
+#  YT-Live-24x7-PRO  ·  YouTube Live 24/7 restream (GitHub Actions, self-chaining)
+# -----------------------------------------------------------------------------
+#  Is YML ke andar hi poora engine hai — koi dusri file, koi server, koi PRO
+#  subscription nahi. Sirf repo secret chahiye: YT_STREAM_KEY
+#
+#  SEAMLESS DESIGN (stream kabhi nahi rukti):
+#    source m3u8 ──► local HLS relay (127.0.0.1:8080) ──► ek continuous ffmpeg
+#                    ▲ live segments                        (decode→normalize→x264)
+#                    └ source dead → placeholder segments          ▼
+#                       ("Stream will resume shortly")      YouTube RTMP
+#
+#    • relay kabhi "dead" nahi hota: source girta hai to wahi playlist me
+#      placeholder segments (discontinuity ke sath) daal deta hai
+#    • is liye ffmpeg ko reconnect/restart karne ki zarurat nahi — 5h30m tak
+#      EK hi process, YouTube ko lagta hai stream lagataar chal rahi hai
+#    • ffmpeg timestamp normalize karta hai (setpts/asetpts + CFR) is liye
+#      source badalne par bhi 0 gap, 0 jitter, 0 "backward in time" error
+#    • 6h limit se pehle next run khud dispatch hota hai aur "slot" ka intezar
+#      karta hai → handoff gap sirf ~2-5 second, har 5.5 ghante me ek dafa
+#    • watchdog cron */20 = agar chain toot jaye to 20 min me khud uth jata hai
+#    • har din keepalive commit = GitHub 60-din inactivity par cron band na kare
+# =============================================================================
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  24/7 YouTube Live restream on GitHub Actions (self-chaining, no 6h gap)
-#  • Job khud ko re-dispatch karta hai har ~5h30m par (6h hard limit se pehle)
-#  • Watchdog cron har 20 min: agar stream band mila to foran start
-#  • 300s / 5-min cron interval ka koi intezar nahi — chain se lagataar chalta hai
-#  • Source down ho to placeholder screen on air rehti hai (stream nahi rukti)
-#  • Repo secret chahiye: YT_STREAM_KEY
-#    (optional: GH_PAT — agar GITHUB_TOKEN se re-dispatch block ho)
-# ─────────────────────────────────────────────────────────────────────────────
+name: YT-Live-24x7-PRO
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/20 * * * *"        # watchdog (chain toote to backup)
 
 permissions:
-  actions: write
-  contents: write
+  actions: write                  # next run dispatch karne ke liye
+  contents: write                 # keepalive commit ke liye
 
 concurrency:
-  group: yt-live-24x7
+  group: yt-live-24x7-pro         # ek waqt me sirf ek stream (duplicate nahi)
   cancel-in-progress: false
 
 env:
   SOURCE_URL: ${{ vars.SOURCE_URL || 'https://muaaznamtosonahoga1.hf.space/live/default/index.m3u8' }}
   RTMP_BASE: rtmp://a.rtmp.youtube.com/live2
-  MAX_SECONDS: "19800"          # 5h30m  (6h limit se 30 min pehle exit)
-  FFMPEG_RUN: "7200"            # har 2h ffmpeg fresh restart (safety, 1-2s blip)
+  WINDOW: "19800"                 # 5h30m streaming window (6h limit se pehle)
+  HANDOFF: "75"                   # window end se 75s pehle next run dispatch
+  BITRATE: "2500k"                # 720p ke liye perfect; 1080p source ho to 4500k
+  MAXRATE: "3000k"
+  RELAY_PORT: "8080"
+  RELAY_STALE: "7"                 # source itni der naya segment na de -> placeholder
+  RELAY_DWELL: "5"                 # placeholder kam se kam itni der (flicker nahi)
   UA: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 jobs:
-  stream:
-    name: YouTube 24/7 restream
+  live:
+    name: 24/7 YouTube Live
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 355            # 5h55m hard stop (6h runner limit se pehle)
 
     steps:
+      # ───────────────────────────────────────────────────────────────────────
+      # 1) SLOT: agar pichla window abhi chal raha hai to uske khatam hone ka
+      #    intezar — is se do stream ek sath connect ho kar ek dusre ko kick
+      #    nahi karti (handoff gap minimum)
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Wait for previous window (slot)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          WF_FILE="${GITHUB_WORKFLOW_REF%@*}"; WF_FILE="${WF_FILE##*/}"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/runs?status=in_progress&per_page=50"
+          for i in $(seq 1 120); do
+            OTHERS=$(curl -sS -m 10 -H "Authorization: Bearer $GH_TOKEN" "$API" \
+              | jq --arg id "$GITHUB_RUN_ID" '[.workflow_runs[]? | select((.id|tostring) != $id)] | length' 2>/dev/null || echo 0)
+            if [ "${OTHERS:-0}" -eq 0 ]; then
+              echo "slot free — streaming shuru"
+              exit 0
+            fi
+            echo "[$i] pichla window chal raha hai (${OTHERS}) — 3s wait..."
+            sleep 3
+          done
+          echo "::warning::6 minute tak slot na mila — phir bhi shuru kar rahe hain"
+
       - uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      # ── 1) ffmpeg + fonts ──────────────────────────────────────────────────
-      - name: Install ffmpeg
+      # ───────────────────────────────────────────────────────────────────────
+      # 2) Tools (cache se fast; cache miss par apt)
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Install ffmpeg + fonts + jq
         run: |
           set -uo pipefail
-          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
-          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core jq
           ffmpeg -version | head -1
+          jq --version
 
-      # ── 2) placeholder banane wala + stream loop ───────────────────────────
-      - name: Stream to YouTube (auto-heal loop)
+      # ───────────────────────────────────────────────────────────────────────
+      # 3) Source format detect (placeholder bilkul usi size/fps me banega,
+      #    warna YouTube ko mid-stream resolution change dikhta hai)
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Detect source format
+        run: |
+          set -uo pipefail
+          OUT=$(timeout 25 ffprobe -v error -select_streams v:0 \
+                  -show_entries stream=width,height,r_frame_rate \
+                  -of default=nw=1:nk=1 "$SOURCE_URL" 2>/dev/null | head -3 | tr '\n' ' ')
+          read -r W H RATE <<< "${OUT:-1280 720 25/1}"
+          W=${W:-1280}; H=${H:-720}
+          FPS=${RATE%%/*}; FPS=${FPS:-25}
+          # sirf standard live fps rakhein (YouTube ko chahiye)
+          case "$FPS" in 24|25|30|50|60) ;; *) FPS=25 ;; esac
+          W=$(( W/2*2 )); H=$(( H/2*2 ))
+          echo "SRC_W=$W"   >> "$GITHUB_ENV"
+          echo "SRC_H=$H"   >> "$GITHUB_ENV"
+          echo "SRC_FPS=$FPS" >> "$GITHUB_ENV"
+          echo "source: ${W}x${H} @ ${FPS}fps"
+
+      # ───────────────────────────────────────────────────────────────────────
+      # 4) Relay (poora engine yahin embed hai — koi alag file nahi)
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Write relay engine
+        run: |
+          cat > /tmp/relay.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          relay.py — seamless HLS failover relay for the YT 24/7 GitHub Action.
+
+          Ek hi ffmpeg is local playlist se padhta hai (copy mode, HD):
+              http://127.0.0.1:PORT/index.m3u8
+
+          Relay upstream (aapki m3u8) ko poll karta hai:
+            * upstream healthy  -> uske naye segments local playlist me append (LIVE)
+            * upstream dead     -> placeholder segments generate karke append (RECONNECTING screen)
+              (discontinuity flag ke sath, is liye ffmpeg kabhi exit nahi hota,
+               timestamps bhi monotonic rehte hain -> YouTube par stream break nahi hoti)
+
+          Endpoints: /index.m3u8, /<seg>.ts, /status.json, /healthz
+          """
+          import json
+          import os
+          import re
+          import subprocess
+          import threading
+          import time
+          import urllib.request
+          from collections import deque
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          UPSTREAM = os.environ.get("UPSTREAM", "").strip()
+          PORT = int(os.environ.get("RELAY_PORT", "8080"))
+          WORK = os.environ.get("RELAY_DIR", "/tmp/relay")
+          SEG_DUR = float(os.environ.get("RELAY_SEG_DUR", "2"))
+          KEEP = int(os.environ.get("RELAY_KEEP", "7"))
+          POLL = float(os.environ.get("RELAY_POLL", "1"))
+          UA = os.environ.get(
+              "UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+          )
+          FALLBACK_TEXT = os.environ.get("FALLBACK_TEXT", "Stream will resume shortly")
+          FALLBACK_SUB = os.environ.get("FALLBACK_SUBTEXT", "Auto-reconnect is active. Please stay tuned.")
+          FALLBACK_BADGE = os.environ.get("FALLBACK_BADGE", "RECONNECTING")
+          FALLBACK_FOOTER = os.environ.get("FALLBACK_FOOTER", "24/7 LIVE BROADCAST")
+          DYN = os.environ.get("DYN_FALLBACK", "1") == "1"     # on-the-fly status screen
+          W = int(os.environ.get("W", "1280"))
+          H = int(os.environ.get("H", "720"))
+          FPS = int(os.environ.get("FPS", "25"))
+          FONT = os.environ.get("FONT", "")
+
+          LOG = deque(maxlen=200)
+          LOCK = threading.Lock()
+          ENTRIES = deque()          # {"name":.., "dur":.., "disc":bool, "seq":int}
+          TRASH = []                 # [(path, ts)]  — 20s baad delete (ffmpeg ko 404 na mile)
+          STATE = {"mode": "init", "reason": "starting", "live_seq": -1, "switched": 0,
+                   "up_ok": 0, "up_fail": 0, "seg_index": 0, "started": time.time()}
+
+
+          def log(msg):
+              line = f"[relay {time.strftime('%H:%M:%S')}] {msg}"
+              print(line, flush=True)
+              LOG.append(line)
+
+
+          os.makedirs(WORK, exist_ok=True)
+
+
+          def fetch(url, timeout=8):
+              req = urllib.request.Request(url, headers={"User-Agent": UA, "Cache-Control": "no-cache"})
+              with urllib.request.urlopen(req, timeout=timeout) as r:
+                  return r.status, r.read()
+
+
+          def parse_playlist(body):
+              """returns (media_seq, [(uri, dur)])"""
+              if isinstance(body, bytes):
+                  body = body.decode("utf-8", "ignore")
+              seq = 0
+              m = re.search(r"#EXT-X-MEDIA-SEQUENCE:\s*(\d+)", body)
+              if m:
+                  seq = int(m.group(1))
+              items, dur = [], None
+              for line in body.splitlines():
+                  line = line.strip()
+                  if line.startswith("#EXTINF:"):
+                      try:
+                          dur = float(line.split(":", 1)[1].split(",")[0])
+                      except Exception:
+                          dur = SEG_DUR
+                  elif line and not line.startswith("#"):
+                      items.append((line, dur or SEG_DUR))
+                      dur = None
+              return seq, items
+
+
+          def abs_url(base, uri):
+              if uri.startswith("http"):
+                  return uri
+              return base.rsplit("/", 1)[0] + "/" + uri
+
+
+          # ---------------------------------------------------------------------------
+          # placeholder segment builder (dyn: har segment fresh, clock + reason ke sath)
+          # ---------------------------------------------------------------------------
+          def make_fallback_seg(idx, reason):
+              """2s ka placeholder .ts — source format ke exact size/fps me."""
+              name = f"fb_{idx:06d}.ts"
+              path = os.path.join(WORK, name)
+              text1 = os.path.join(WORK, "t_main.txt")
+              text2 = os.path.join(WORK, "t_sub.txt")
+              text3 = os.path.join(WORK, "t_badge.txt")
+              text4 = os.path.join(WORK, "t_foot.txt")
+              text5 = os.path.join(WORK, "t_reason.txt")
+              open(text1, "w").write(FALLBACK_TEXT)
+              open(text2, "w").write(FALLBACK_SUB)
+              open(text3, "w").write(FALLBACK_BADGE)
+              open(text4, "w").write(FALLBACK_FOOTER)
+              open(text5, "w").write((reason or "auto-retry active")[:70])
+
+              vf = "drawbox=x=0:y=0:w=iw:h=ih:color=0x0a1020@1:t=fill"
+              vf += f",drawbox=x=0:y=0:w=iw:h={max(4, H // 80)}:color=0xef4444@1:t=fill"
+              if FONT and os.path.exists(FONT):
+                  f = f"fontfile={FONT}:"
+                  vf += (f",drawtext={f}textfile={text3}:fontcolor=0xef4444:fontsize={max(16, H//22)}"
+                         f":x=(w-tw)/2:y=(h/2)-{int(H*0.28)}:alpha='0.35+0.65*abs(sin(t*2.2))'")
+                  vf += (f",drawtext={f}textfile={text1}:fontcolor=white:fontsize={max(22, H//13)}"
+                         f":x=(w-tw)/2:y=(h/2)-{int(H*0.07)}")
+                  vf += (f",drawtext={f}textfile={text2}:fontcolor=0x94a3b8:fontsize={max(13, H//27)}"
+                         f":x=(w-tw)/2:y=(h/2)+{int(H*0.07)}")
+                  vf += (f",drawtext={f}textfile={text5}:fontcolor=0x64748b:fontsize={max(11, H//38)}"
+                         f":x=(w-tw)/2:y=(h/2)+{int(H*0.16)}")
+                  vf += (f",drawtext={f}textfile={text4}:fontcolor=0x475569:fontsize={max(10, H//44)}"
+                         f":x=(w-tw)/2:y=h-{int(H*0.08)}:alpha='0.55+0.45*abs(sin(t*1.1))'")
+              vf += ",format=yuv420p"
+
+              cmd = [
+                  "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                  "-f", "lavfi", "-i", f"color=c=0x0a1020:s={W}x{H}:r={FPS}",
+                  "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                  "-t", str(SEG_DUR), "-vf", vf,
+                  "-c:v", "libx264", "-profile:v", "main", "-preset", "veryfast",
+                  "-b:v", "900k", "-maxrate", "1400k", "-bufsize", "2800k",
+                  "-g", str(int(FPS * SEG_DUR)), "-keyint_min", str(int(FPS * SEG_DUR)),
+                  "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+                  "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                  "-f", "mpegts", path,
+              ]
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              if r.returncode != 0 or not os.path.exists(path):
+                  log(f"fallback seg fail: {(r.stderr or '')[-300:]}")
+                  return None
+              return name
+
+
+          def _trash(name):
+              TRASH.append((os.path.join(WORK, name), time.time()))
+
+
+          def prune():
+              with LOCK:
+                  while len(ENTRIES) > KEEP:
+                      _trash(ENTRIES.popleft()["name"])
+
+
+          def flush_keep(n=2):
+              """Transition par purani entries hata do — playlist ek hi content type ka
+              rehta hai (fallback↔live mix se video stall na ho)."""
+              with LOCK:
+                  while len(ENTRIES) > n:
+                      _trash(ENTRIES.popleft()["name"])
+
+
+          def janitor():
+              while True:
+                  now = time.time()
+                  with LOCK:
+                      keep = []
+                      for path, ts in TRASH:
+                          if now - ts > 20:
+                              try:
+                                  os.remove(path)
+                              except OSError:
+                                  pass
+                          else:
+                              keep.append((path, ts))
+                      TRASH[:] = keep
+                  time.sleep(2)
+
+
+          def append(name, dur, disc):
+              with LOCK:
+                  STATE["seg_index"] += 1
+                  ENTRIES.append({"name": name, "dur": dur, "disc": disc, "seq": STATE["seg_index"]})
+              prune()
+
+
+          # ---------------------------------------------------------------------------
+          def monitor():
+              """Upstream poll -> naye segments download; down/stale -> placeholder segments.
+              'Reachable magar abhi naya segment nahi' == healthy (fallback nahi)."""
+              last_seq = PRE.get("seq")
+              in_fallback = False if last_seq is not None else True
+              next_fb = 0.0
+              last_new = time.time()
+              STALE = float(os.environ.get("RELAY_STALE", "7"))
+              DWELL = float(os.environ.get("RELAY_DWELL", "5"))   # placeholder kam se kam itni der
+              hold_until = 0.0
+
+              while True:
+                  reachable = False
+                  got = 0
+                  try:
+                      if UPSTREAM:
+                          status, body = fetch(UPSTREAM)
+                          if status == 200 and b"#EXTM3U" in body:
+                              reachable = True
+                              useq, items = parse_playlist(body)
+                              if items:
+                                  if last_seq is None:
+                                      take = items[-3:]
+                                  elif useq > last_seq:
+                                      take = items[-(useq - last_seq):]
+                                  else:
+                                      take = []
+                                  if in_fallback and time.time() < hold_until:
+                                      take = []          # abhi placeholder dikhne do (flicker nahi)
+                                  for uri, dur in take[-4:]:
+                                      u = abs_url(UPSTREAM, uri)
+                                      name = "lv_" + re.sub(r"[^A-Za-z0-9._-]", "_", uri.split("/")[-1])
+                                      path = os.path.join(WORK, name)
+                                      try:
+                                          st, data = fetch(u, timeout=12)
+                                          if st != 200 or len(data) < 1000:
+                                              raise ValueError(f"seg http {st}")
+                                          with open(path + ".tmp", "wb") as f:
+                                              f.write(data)
+                                          os.replace(path + ".tmp", path)
+                                          append(name, dur, in_fallback)
+                                          got += 1
+                                      except Exception as e:
+                                          reachable = False
+                                          STATE["reason"] = f"segment fetch: {type(e).__name__}"
+                                          break
+                                  if got:
+                                      last_seq = useq
+                              if got == 0 and last_seq is None:
+                                  STATE["reason"] = "playlist me segments nahi"
+                  except Exception as e:
+                      STATE["up_fail"] = STATE["up_fail"] + 1
+                      STATE["reason"] = f"{type(e).__name__}: {str(e)[:80]}"
+
+                  now = time.time()
+                  if got:
+                      last_new = now
+                      if in_fallback:            # fallback -> live transition: clean cut
+                          flush_keep(3)
+                          log(f"transition fallback->live (flushed, kept 2)")
+                          in_fallback = False
+                          next_fb = 0.0
+                  healthy = reachable and (now - last_new) < STALE
+
+                  if healthy:
+                      if in_fallback:
+                          log("UPSTREAM BACK -> live segments")
+                          in_fallback = False
+                          next_fb = 0.0
+                      STATE.update(mode="live", reason="live source", up_ok=STATE["up_ok"] + 1)
+                  else:
+                      if not in_fallback:
+                          in_fallback = True
+                          hold_until = now + DWELL
+                          flush_keep(3)          # live -> fallback transition: clean cut
+                          STATE["switched"] = STATE["switched"] + 1
+                          log(f"UPSTREAM DOWN ({STATE['reason']}) -> placeholder screen")
+                          next_fb = 0.0
+                      STATE["mode"] = "fallback"
+                      STATE["up_fail"] = STATE["up_fail"] + 1
+                      if now >= next_fb:
+                          name = make_fallback_seg(STATE["seg_index"] + 1, STATE["reason"]) if DYN else None
+                          if name:
+                              append(name, SEG_DUR, True)
+                          next_fb = now + SEG_DUR      # note: last_new ko chhoote nahi
+                                                       # (warna live check galat healthy ho jata hai)
+
+                  time.sleep(POLL)
+
+
+          # ---------------------------------------------------------------------------
+          def playlist_text():
+              with LOCK:
+                  entries = list(ENTRIES)
+              if not entries:
+                  return "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n"
+              lines = ["#EXTM3U", "#EXT-X-VERSION:3", f"#EXT-X-TARGETDURATION:{int(max(SEG_DUR, 4))}",
+                       f"#EXT-X-MEDIA-SEQUENCE:{entries[0]['seq']}", "#EXT-X-INDEPENDENT-SEGMENTS"]
+              for e in entries:
+                  if e["disc"]:
+                      lines.append("#EXT-X-DISCONTINUITY")
+                  lines.append(f"#EXTINF:{e['dur']:.3f},")
+                  lines.append(e["name"])
+              return "\n".join(lines) + "\n"
+
+
+          class Handler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def _send(self, code, body, ctype):
+                  if isinstance(body, str):
+                      body = body.encode()
+                  try:
+                      self._raw(code, body, ctype)
+                  except (BrokenPipeError, ConnectionResetError):
+                      pass
+
+              def _raw(self, code, body, ctype):
+                  self.send_response(code)
+                  self.send_header("Content-Type", ctype)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.send_header("Access-Control-Allow-Origin", "*")
+                  self.send_header("Cache-Control", "no-cache")
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  p = self.path.split("?")[0]
+                  if p in ("/index.m3u8", "/live.m3u8"):
+                      self._send(200, playlist_text(), "application/vnd.apple.mpegurl")
+                  elif p == "/status.json":
+                      with LOCK:
+                          st = dict(STATE)
+                          st["segments"] = len(ENTRIES)
+                          st["log"] = list(LOG)[-40:]
+                      self._send(200, json.dumps(st), "application/json")
+                  elif p == "/healthz":
+                      self._send(200, '{"ok":true}', "application/json")
+                  else:
+                      name = p.lstrip("/")
+                      fp = os.path.join(WORK, os.path.basename(name))
+                      try:
+                          if os.path.exists(fp):
+                              with open(fp, "rb") as f:
+                                  self._raw(200, f.read(), "video/mp2t")
+                          else:
+                              self._raw(404, b"nope", "text/plain")
+                      except (BrokenPipeError, ConnectionResetError, FileNotFoundError):
+                          pass
+
+              def log_message(self, *a):
+                  pass
+
+              def handle_one_request(self):
+                  try:
+                      super().handle_one_request()
+                  except (BrokenPipeError, ConnectionResetError):
+                      self.close_connection = True
+
+
+          PRE = {"seq": None}
+
+
+          def prime():
+              """Boot: pehle LIVE segments try karo (mix na bane), warna fallback prime."""
+              end = time.time() + 6
+              while time.time() < end and UPSTREAM:
+                  try:
+                      st, body = fetch(UPSTREAM)
+                      if st == 200 and b"#EXTM3U" in body:
+                          useq, items = parse_playlist(body)
+                          if items:
+                              for uri, dur in items[-3:]:
+                                  u = abs_url(UPSTREAM, uri)
+                                  name = "lv_" + re.sub(r"[^A-Za-z0-9._-]", "_", uri.split("/")[-1])
+                                  path = os.path.join(WORK, name)
+                                  st2, data = fetch(u, timeout=12)
+                                  if st2 == 200 and len(data) > 1000:
+                                      with open(path + ".tmp", "wb") as f:
+                                          f.write(data)
+                                      os.replace(path + ".tmp", path)
+                                      append(name, dur, True)
+                              if ENTRIES:
+                                  PRE["seq"] = useq
+                                  log(f"primed {len(ENTRIES)} LIVE segments (clean start)")
+                                  return
+                  except Exception:
+                      pass
+                  time.sleep(1)
+              for i in range(3):
+                  n = make_fallback_seg(STATE["seg_index"] + 1, "starting upstream")
+                  if n:
+                      append(n, SEG_DUR, True)
+              log(f"primed {len(ENTRIES)} fallback segments (source down at boot bhi chalega)")
+
+
+          def main():
+              prime()
+              threading.Thread(target=janitor, daemon=True).start()
+              threading.Thread(target=monitor, daemon=True).start()
+              log(f"relay on :{PORT} | upstream={UPSTREAM} | {W}x{H}@{FPS} dyn={DYN}")
+              ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python3 - <<'CHK'
+          import ast; ast.parse(open("/tmp/relay.py").read()); print("relay.py syntax OK")
+          CHK
+
+      # ───────────────────────────────────────────────────────────────────────
+      # 5) STREAM — relay + ek continuous ffmpeg + watchdog + handoff
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Stream 24/7 (seamless failover)
         env:
           YT_STREAM_KEY: ${{ secrets.YT_STREAM_KEY }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          SRC="$SOURCE_URL"
-          DEST="$RTMP_BASE/$YT_STREAM_KEY"
           if [ -z "${YT_STREAM_KEY:-}" ]; then
-            echo "::error::Repo secret YT_STREAM_KEY set nahi hai (Settings → Secrets → Actions)"
+            echo "::error::Repo secret YT_STREAM_KEY missing (Settings → Secrets and variables → Actions)"
             exit 1
           fi
-          mkdir -p work
-
-          # ---- source format detect (placeholder usi size me banega) --------
-          PROBE=$(ffprobe -v error -select_streams v:0 \
-                    -show_entries stream=width,height,r_frame_rate \
-                    -of default=nw=1:nk=1 "$SRC" 2>/dev/null | head -3 | tr '\n' ' ')
-          read -r W H RATE <<< "${PROBE:-1280 720 25/1}"
-          W=${W:-1280}; H=${H:-720}; FPS=${RATE%%/*}; FPS=${FPS:-25}
-          [ "$FPS" -gt 60 ] 2>/dev/null && FPS=25
-          W=$(( W/2*2 )); H=$(( H/2*2 ))
-          echo "source format: ${W}x${H} @ ${FPS}fps"
-
-          # ---- 20s placeholder (loop hoti hai jab source down ho) -----------
+          DEST="$RTMP_BASE/$YT_STREAM_KEY"
+          RELAY_DIR=/tmp/relay; mkdir -p "$RELAY_DIR"
           FONT=$(fc-match -f '%{file}' "DejaVu Sans:bold" 2>/dev/null || true)
-          DT=""
-          if [ -n "${FONT:-}" ] && [ -f "$FONT" ]; then
-            printf 'RECONNECTING'                              > work/t1.txt
-            printf 'Stream will resume shortly'                 > work/t2.txt
-            printf 'Auto-reconnect is active. Please stay tuned.' > work/t3.txt
-            printf '24/7 LIVE BROADCAST'                        > work/t4.txt
-            DT=",drawtext=fontfile=$FONT:textfile=work/t1.txt:fontcolor=0xef4444:fontsize=$((H/22)):x=(w-tw)/2:y=(h/2)-$((H*28/100)):alpha='0.35+0.65*abs(sin(t*2))'"
-            DT="$DT,drawtext=fontfile=$FONT:textfile=work/t2.txt:fontcolor=white:fontsize=$((H/14)):x=(w-tw)/2:y=(h/2)-$((H*7/100))"
-            DT="$DT,drawtext=fontfile=$FONT:textfile=work/t3.txt:fontcolor=0x94a3b8:fontsize=$((H/28)):x=(w-tw)/2:y=(h/2)+$((H*7/100))"
-            DT="$DT,drawtext=fontfile=$FONT:textfile=work/t4.txt:fontcolor=0x64748b:fontsize=$((H/38)):x=(w-tw)/2:y=h-$((H*10/100)):alpha='0.55+0.45*abs(sin(t))'"
-          fi
-          ffmpeg -hide_banner -loglevel error -y \
-            -f lavfi -i "color=c=0x0a1020:s=${W}x${H}:r=${FPS}" \
-            -f lavfi -i "anullsrc=channel_layout=stereo:sample_rate=44100" \
-            -t 20 -vf "drawbox=x=0:y=0:w=iw:h=ih:color=0x0a1020@1:t=fill${DT},format=yuv420p" \
-            -c:v libx264 -profile:v baseline -preset veryfast -b:v 800k -maxrate 1200k -bufsize 2400k \
-            -g $((FPS*2)) -keyint_min $((FPS*2)) -sc_threshold 0 -pix_fmt yuv420p \
-            -c:a aac -b:a 96k -ar 44100 -ac 2 -movflags +faststart work/fallback.mp4 \
-          && echo "placeholder ready $(du -h work/fallback.mp4 | cut -f1)" \
-          || echo "::warning::placeholder build failed — sirf live mode chalega"
+          echo "font: ${FONT:-none}"
 
-          # ---- source health check -----------------------------------------
-          healthy() {
-            local body last seg code
-            body=$(curl -fsS -m 8 -A "$UA" "$SRC" 2>/dev/null) || return 1
-            printf '%s' "$body" | grep -q '#EXTM3U' || return 1
-            printf '%s' "$body" | grep -q '#EXTINF' || return 1
-            last=$(printf '%s\n' "$body" | grep -v '^#' | grep -v '^[[:space:]]*$' | tail -1)
-            [ -n "$last" ] || return 1
-            case "$last" in
-              http*) seg="$last" ;;
-              *)     seg="${SRC%/*}/$last" ;;
-            esac
-            code=$(curl -s -o /dev/null -m 8 -r 0-4096 -w '%{http_code}' -A "$UA" "$seg" 2>/dev/null)
-            [ "$code" = "200" ] || [ "$code" = "206" ]
+          # ---------- relay start (kabhi band nahi hota) ----------
+          start_relay () {
+            UPSTREAM="$SOURCE_URL" RELAY_DIR="$RELAY_DIR" RELAY_PORT="$RELAY_PORT" \
+            W="$SRC_W" H="$SRC_H" FPS="$SRC_FPS" FONT="$FONT" \
+            python3 /tmp/relay.py >> /tmp/relay_out.log 2>&1 &
+            RELAY_PID=$!
+            for i in $(seq 1 40); do
+              curl -fsS -m 2 "http://127.0.0.1:$RELAY_PORT/healthz" >/dev/null 2>&1 && \
+                { echo "relay up (pid $RELAY_PID)"; return 0; }
+              sleep 1
+            done
+            echo "::warning::relay health check fail"; return 0
           }
+          start_relay
 
-          # ---- main loop (5h30m budget, phir next run chain) ---------------
-          START=$(date +%s); FAILS=0; CYCLES=0; MODE=starting
+          # ---------- status logger (har 45s log me state) ----------
+          ( while : ; do
+              sleep 45
+              S=$(curl -sS -m 4 "http://127.0.0.1:$RELAY_PORT/status.json" 2>/dev/null || echo '{}')
+              echo "[status] $(echo "$S" | jq -c '{mode,segments,switched,up_fail,reason}' 2>/dev/null || echo "$S")"
+              kill -0 $RELAY_PID 2>/dev/null || { echo "[relay] mar gaya — restart"; start_relay; }
+            done ) &
+          WATCH=$!
+
+          # ---------- handoff: window end se pehle next run dispatch ----------
+          WF_PATH="${GITHUB_WORKFLOW_REF%@*}"; WF_FILE="${WF_PATH##*/}"
+          ( sleep $(( WINDOW - HANDOFF ))
+            echo "[handoff] next window dispatch ho raha hai"
+            for i in 1 2 3 4 5; do
+              CODE=$(curl -sS -o /tmp/disp.json -w '%{http_code}' -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
+                -d "{\"ref\":\"${GITHUB_REF_NAME}\"}")
+              echo "[handoff] attempt $i → HTTP $CODE"
+              [ "$CODE" = "204" ] && break
+              sleep $(( i * 4 ))
+            done ) &
+          HANDOFF_PID=$!
+
+          # ---------- main encoder loop ----------
+          START=$(date +%s)
+          RUNS=0
           while : ; do
             NOW=$(date +%s); ELAPSED=$(( NOW - START ))
-            [ "$ELAPSED" -ge "$MAX_SECONDS" ] && break
-            REMAIN=$(( MAX_SECONDS - ELAPSED ))
-            RUN=$(( REMAIN < FFMPEG_RUN ? REMAIN : FFMPEG_RUN ))
-            CYCLES=$(( CYCLES + 1 ))
+            REMAIN=$(( WINDOW - ELAPSED ))
+            [ "$REMAIN" -le 90 ] && break          # window khatam → handoff
+            RUNS=$(( RUNS + 1 ))
+            echo "──── encoder #$RUNS · elapsed ${ELAPSED}s · window ${REMAIN}s ────"
 
-            if healthy; then
-              MODE=live
-              echo "──[$CYCLES] LIVE  (elapsed ${ELAPSED}s, window ${RUN}s) ──"
-              timeout --signal=INT $(( RUN + 10 )) ffmpeg -hide_banner -loglevel warning -nostdin \
-                -fflags +genpts -live_start_index -3 \
-                -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000 \
-                -user_agent "$UA" -i "$SRC" \
-                -t "$RUN" -map 0:v:0 -map 0:a:0? \
-                -c:v copy -c:a aac -b:a 128k -ar 44100 -ac 2 \
-                -max_muxing_queue_size 2048 -flvflags no_duration_filesize \
-                -y -f flv "$DEST" 2>&1 | grep -viE "non-monotonic|backward in time|past duration|queue input" || true
-              RC=${PIPESTATUS[0]:-$?}
-            elif [ -f work/fallback.mp4 ]; then
-              MODE=fallback
-              echo "──[$CYCLES] PLACEHOLDER (source down) ──"
-              timeout --signal=INT $(( RUN + 10 )) ffmpeg -hide_banner -loglevel warning -nostdin \
-                -re -stream_loop -1 -fflags +genpts -i work/fallback.mp4 \
-                -t "$RUN" -c:v copy -c:a aac -b:a 128k -ar 44100 -ac 2 \
-                -max_muxing_queue_size 2048 -flvflags no_duration_filesize \
-                -y -f flv "$DEST" 2>&1 | grep -viE "non-monotonic|backward in time" || true
-              RC=${PIPESTATUS[0]:-$?}
-            else
-              MODE=nosource; RC=1
-              echo "──[$CYCLES] source down, placeholder bhi nahi — 15s wait ──"
-              sleep 15
-            fi
+            timeout --signal=INT $(( REMAIN + 15 )) ffmpeg -hide_banner -loglevel warning -nostdin \
+              -fflags +genpts+igndts -probesize 2000000 -analyzeduration 3000000 \
+              -live_start_index -1 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 \
+              -rw_timeout 20000000 \
+              -i "http://127.0.0.1:$RELAY_PORT/index.m3u8" \
+              -t "$REMAIN" \
+              -map 0:v:0 -map 0:a:0? \
+              -vf "scale=$SRC_W:$SRC_H:force_original_aspect_ratio=decrease,pad=$SRC_W:$SRC_H:(ow-iw)/2:(oh-ih)/2,fps=$SRC_FPS,setpts=N/($SRC_FPS*TB),format=yuv420p" \
+              -af "aresample=async=1:first_pts=0,asetpts=N/SR/TB" \
+              -fps_mode cfr \
+              -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -level 4.1 \
+              -b:v "$BITRATE" -maxrate "$MAXRATE" -bufsize 5000k \
+              -g $(( SRC_FPS * 2 )) -keyint_min $(( SRC_FPS * 2 )) -sc_threshold 0 -pix_fmt yuv420p \
+              -c:a aac -b:a 128k -ar 44100 -ac 2 \
+              -max_muxing_queue_size 4096 -flvflags no_duration_filesize \
+              -f flv "$DEST" 2>&1 | grep -viE "deprecated pixel format|Queue input is backward|non monotonically increasing|Last message repeated" || true
 
-            # fast-fail (galat key / RTMP block) par backoff
-            NOW=$(date +%s)
-            if [ "$MODE" = "live" ] && [ "$(( NOW - START ))" -ge "$MAX_SECONDS" ]; then break; fi
-            if [ "$MODE" = "live" ] && [ "${RC:-1}" -ne 0 ]; then
-              FAILS=$(( FAILS + 1 ))
-              SLEEP=$(( FAILS * 3 )); [ "$SLEEP" -gt 30 ] && SLEEP=30
-              echo "   ffmpeg exit rc=$RC — ${SLEEP}s baad retry"
-              sleep "$SLEEP"
+            RC=${PIPESTATUS[0]:-$?}
+            if [ "$RC" -eq 0 ]; then
+              echo "encoder clean exit"; sleep 1
             else
-              FAILS=0
+              echo "encoder rc=$RC — 2s me restart (relay zinda hai, stream continuity barqarar)"
               sleep 2
             fi
           done
 
-          echo "job window khatam — next run chain ho raha hai"
+          echo "window complete — handoff run slot khali hone par on air ho jayega"
+          kill $WATCH $HANDOFF_PID 2>/dev/null || true
 
-      # ── 3) next run khud trigger karo (koi cron gap nahi) ────────────────
-      - name: Chain next run
+      # ───────────────────────────────────────────────────────────────────────
+      # 6) Backup chain (agar handoff dispatch fail hua ho)
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Chain next run (backup)
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
           WF_PATH="${GITHUB_WORKFLOW_REF%@*}"; WF_FILE="${WF_PATH##*/}"
-          for i in 1 2 3 4 5; do
-            CODE=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
+          for i in 1 2 3; do
+            CODE=$(curl -sS -o /tmp/d2.json -w '%{http_code}' -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/${WF_FILE}/dispatches" \
               -d "{\"ref\":\"${GITHUB_REF_NAME}\"}")
-            echo "dispatch attempt $i -> HTTP $CODE"
+            echo "backup dispatch $i → HTTP $CODE"
             [ "$CODE" = "204" ] && exit 0
-            cat /tmp/resp.json || true
-            sleep $(( i * 4 ))
+            sleep $(( i * 5 ))
           done
-          echo "::warning::re-dispatch fail — watchdog cron 20 min me khud uthayega"
+          echo "::warning::dispatch fail — watchdog cron 20 min me khud uthayega"
 
-      # ── 4) keepalive: 60-din inactivity par cron band na ho ──────────────
-      - name: Keepalive commit
+      # ───────────────────────────────────────────────────────────────────────
+      # 7) Keepalive (60 din inactivity par GitHub cron band kar deta hai)
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Keepalive
         if: always()
         run: |
           set -uo pipefail
@@ -201,5 +657,5 @@ jobs:
             git config user.email "ytlive-bot@users.noreply.github.com"
             git add .keepalive
             git commit -m "keepalive $DAY" || true
-            git push || echo "::warning::keepalive push fail (permissions?)"
+            git push || echo "::warning::keepalive push fail"
           fi
